@@ -1,0 +1,240 @@
+
+name: Build Chromium offline bundle (Ubuntu 26.04 amd64)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+
+    steps:
+      - name: Prepare snap tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y squashfs-tools python3-yaml
+          sudo systemctl enable --now snapd.socket
+          sudo systemctl start snapd.service || true
+
+          for i in $(seq 1 60); do
+            snap version && break
+            sleep 2
+          done
+          snap version
+
+      - name: Download Chromium and its Snap dependencies
+        run: |
+          set -euxo pipefail
+          mkdir -p out/snaps out/debs
+          cd out/snaps
+
+          snap download chromium --channel=latest/stable
+
+          CHROMIUM_SNAP=$(find . -name 'chromium_*.snap' -print -quit)
+          test -n "$CHROMIUM_SNAP"
+
+          unsquashfs -cat "$CHROMIUM_SNAP" meta/snap.yaml \
+            > /tmp/chromium-snap.yaml
+
+          python3 - <<'PY'
+          import yaml
+          from pathlib import Path
+
+          meta = yaml.safe_load(
+              Path("/tmp/chromium-snap.yaml").read_text()
+          )
+
+          deps = []
+          base = meta.get("base")
+
+          if base and base != "none":
+              deps.append(base)
+
+          for plug in (meta.get("plugs") or {}).values():
+              if isinstance(plug, dict):
+                  if plug.get("interface") == "content":
+                      provider = plug.get("default-provider")
+                      if provider:
+                          deps.append(provider)
+
+          # GTK theme provider is commonly used by graphical snaps.
+          deps.append("gtk-common-themes")
+
+          ordered = []
+          for name in deps:
+              if name != "chromium" and name not in ordered:
+                  ordered.append(name)
+
+          ordered.append("chromium")
+
+          Path("../snap-install-order.txt").write_text(
+              "\n".join(ordered) + "\n"
+          )
+
+          print("Snap installation order:")
+          print(" -> ".join(ordered))
+          PY
+
+          while IFS= read -r name; do
+            [ "$name" = "chromium" ] && continue
+
+            if ! compgen -G "${name}_*.snap" > /dev/null; then
+              snap download "$name" --channel=latest/stable
+            fi
+          done < ../snap-install-order.txt
+
+      - name: Download snapd deb packages
+        run: |
+          set -euxo pipefail
+          docker pull ubuntu:26.04
+
+          docker run --rm \
+            -v "$PWD/out/debs:/out" \
+            ubuntu:26.04 bash -euxo pipefail -c '
+              apt-get update
+              apt-get install -y --download-only \
+                --no-install-recommends snapd
+              cp -v /var/cache/apt/archives/*.deb /out/
+            '
+
+      - name: Create offline installer
+        run: |
+          set -euxo pipefail
+
+          cat > out/install_chromium_offline.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          cd "$(dirname "$0")"
+
+          if [ "$(dpkg --print-architecture)" != "amd64" ]; then
+            echo "This package requires amd64."
+            exit 1
+          fi
+
+          if ! grep -q '^VERSION_ID="26.04"' /etc/os-release; then
+            echo "This package requires Ubuntu 26.04."
+            exit 1
+          fi
+
+          echo "Checking package integrity..."
+          sha256sum -c SHA256SUMS
+
+          shopt -s nullglob
+          debs=(debs/*.deb)
+
+          if (( ${#debs[@]} > 0 )); then
+            sudo apt-get --no-download --yes \
+              --no-install-recommends install "${debs[@]}"
+          fi
+
+          echo "Starting snapd..."
+          sudo systemctl enable --now snapd.socket
+          sudo systemctl start snapd.service || true
+
+          for i in $(seq 1 90); do
+            if snap version >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+
+          snap version
+
+          echo "Importing Snap signatures..."
+          for assertion in snaps/*.assert; do
+            sudo snap ack "$assertion"
+          done
+
+          echo "Installing Snap dependencies..."
+          while IFS= read -r name; do
+            [ -z "$name" ] && continue
+
+            snap_file=$(find snaps -name "${name}_*.snap" \
+              -print -quit)
+
+            if [ -z "$snap_file" ]; then
+              echo "Missing snap: $name"
+              exit 1
+            fi
+
+            if ! snap list "$name" >/dev/null 2>&1; then
+              sudo snap install "$snap_file"
+            fi
+          done < snap-install-order.txt
+
+          echo
+          echo "Chromium installation complete."
+          snap list chromium
+          echo "Launch Chromium with: chromium"
+          EOF
+
+          chmod +x out/install_chromium_offline.sh
+
+          {
+            echo "Chromium offline bundle"
+            echo "Target: Ubuntu 26.04 amd64"
+            echo "Channel: latest/stable"
+            echo "Build time: $(date -u +%FT%TZ)"
+            echo
+            echo "Snap installation order:"
+            cat out/snap-install-order.txt
+            echo
+            echo "Snap files:"
+            find out/snaps -maxdepth 1 -type f -printf '%f\n' | sort
+            echo
+            echo "Debian packages:"
+            for f in out/debs/*.deb; do
+              dpkg-deb -f "$f" Package Version Architecture
+              echo
+            done
+          } > out/package-inventory.txt
+
+          cat > out/README.txt <<'EOF'
+          Chromium offline bundle
+          Target: Ubuntu 26.04 amd64
+
+          Contents:
+            snaps/                    Chromium and runtime snaps
+            snaps/*.assert            Signed Snap assertions
+            debs/                     snapd and APT dependencies
+            snap-install-order.txt    Required installation order
+            install_chromium_offline.sh
+            package-inventory.txt
+            SHA256SUMS
+
+          Install:
+            chmod +x install_chromium_offline.sh
+            ./install_chromium_offline.sh
+
+          Run:
+            chromium
+
+          Target requires Ubuntu 26.04 amd64, systemd and sudo.
+          The bundle captures latest/stable at build time.
+          EOF
+
+          cd out
+          find . -type f ! -name SHA256SUMS -print0 \
+            | sort -z | xargs -0 sha256sum > SHA256SUMS
+          cd ..
+
+          tar -czf chromium-offline-ubuntu2604-amd64.tar.gz \
+            -C out .
+
+          sha256sum chromium-offline-ubuntu2604-amd64.tar.gz \
+            > chromium-offline-ubuntu2604-amd64.tar.gz.sha256
+
+      - name: Upload offline bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: chromium-offline-ubuntu2604-amd64
+          path: |
+            chromium-offline-ubuntu2604-amd64.tar.gz
+            chromium-offline-ubuntu2604-amd64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
